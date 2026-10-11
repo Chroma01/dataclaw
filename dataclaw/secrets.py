@@ -277,9 +277,7 @@ def should_skip_structured_string_transform(
     """Return True for schema-marked binary/document payload strings we should not rewrite."""
     if key == "data" and isinstance(parent_dict, dict) and parent_dict.get("type") == "base64":
         return True
-    if key == "url" and value.startswith("data:"):
-        return True
-    return False
+    return bool(key == "url" and value.startswith("data:"))
 
 
 def contains_large_binary_value(value: Any) -> bool:
@@ -334,7 +332,7 @@ _FAST_PATH_LOWER_AUTOMATON = _build_marker_automaton(_FAST_PATH_LOWER_MARKERS)
 
 
 class _FastPathState:
-    __slots__ = ("text", "_case_markers", "_lower_markers", "_has_digit", "_has_telegram_prefix", "_has_ipv4_candidate")
+    __slots__ = ("_case_markers", "_has_digit", "_has_ipv4_candidate", "_has_telegram_prefix", "_lower_markers", "text")
 
     def __init__(self, text: str):
         self.text = text
