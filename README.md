@@ -120,11 +120,14 @@ DataClaw applies multiple layers of protection:
 3. Entropy analysis - Long high-entropy strings in quotes are flagged as potential secrets
 4. Email redaction - Regex pattern catches email addresses
 5. Custom redaction - You can configure additional strings to redact
-6. Tool call redaction - Tool inputs and outputs are redacted with the same standard as regular messages
+6. Structured redaction - All session fields, tool inputs and outputs, nested metadata, dictionary keys, and embedded JSON containers are checked. Secret-named fields such as `API_KEY_BACKUP` also provide context for opaque values.
 
 **This is NOT foolproof.** Always review your exported data before publishing.
 Automated redaction cannot catch everything - especially service-specific
-identifiers, third-party PII, or secrets in unusual formats.
+identifiers, third-party PII, or secrets in unusual formats. Binary attachments and
+base64 payloads are preserved; this redactor does not decode attachments or read
+text from images. Embedded JSON decoding is limited to eight nested wrappers.
+Credential-shaped examples may also be redacted conservatively.
 
 We recommend converting the exported jsonl into human-readable yaml using `dataclaw jsonl-to-yaml`,
 then use tools such as [trufflehog](https://github.com/trufflesecurity/trufflehog) and [gitleaks](https://github.com/gitleaks/gitleaks) to scan it.

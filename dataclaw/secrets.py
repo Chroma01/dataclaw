@@ -1,5 +1,8 @@
 """Detect and redact secrets in conversation data."""
 
+import base64
+import binascii
+import json
 import math
 import re
 from typing import Any
@@ -16,16 +19,25 @@ _GENERIC_SECRET_SUFFIXES = (
     "secret",
     "token",
     "password",
+    "passwd",
 )
 _GENERIC_SECRET_SUFFIX_RE = "|".join(re.escape(name) for name in _GENERIC_SECRET_SUFFIXES)
-_GENERIC_SECRET_NAME_PATTERN = rf"[A-Za-z0-9_-]*?(?:{_GENERIC_SECRET_SUFFIX_RE})"
-_GENERIC_SECRET_MARKERS = tuple(
-    f"{suffix}{delimiter}" for suffix in _GENERIC_SECRET_SUFFIXES for delimiter in ("=", ":", '"', "'", " ")
+_GENERIC_SECRET_NAME_PATTERN = (
+    rf"(?:(?:[A-Za-z0-9]+[_-])*(?:{_GENERIC_SECRET_SUFFIX_RE})"
+    rf"|(?:api|access|refresh|client|service|signing|private|session|bot|secret)(?:{_GENERIC_SECRET_SUFFIX_RE})"
+    r"|(?-i:[a-z][A-Za-z0-9]*(?:Auth|Key|Secret|Token|Password)))"
+    r"(?:[_-][A-Za-z0-9]+)*"
 )
+_GENERIC_SECRET_NAME_RE = re.compile(rf"{_GENERIC_SECRET_NAME_PATTERN}\Z", re.IGNORECASE)
+# A suffix can be followed by another name component, tabs, or newlines.
+# Fast paths must never be narrower than their corresponding detector.
+_GENERIC_SECRET_MARKERS = _GENERIC_SECRET_SUFFIXES
+_OPAQUE_SECRET_CHARS = r"A-Za-z0-9_/+=.:%@!~$*?\-"
 _FAST_PATH_CASE_MARKERS = (
     "eyJ",
     "sk-ant-",
     "sk-",
+    "sb_secret_",
     "AIzaSy",
     "gsk_",
     "fm1_",
@@ -47,7 +59,10 @@ _FAST_PATH_CASE_MARKERS = (
     "密码",
 )
 _FAST_PATH_LOWER_MARKERS = tuple(
-    dict.fromkeys(("postgres", "secret_key", "aws_secret_access_key", "password", "passwd") + _GENERIC_SECRET_MARKERS)
+    dict.fromkeys(
+        ("postgres", "secret_key", "aws_secret_access_key", "password", "passwd", "bearer", "bot")
+        + _GENERIC_SECRET_MARKERS
+    )
 )
 _NON_ANON_STRING_KEYS = frozenset(
     {
@@ -80,8 +95,28 @@ SECRET_PATTERNS = [
     ("db_url", re.compile(r"postgres(?:ql)?://[^:]+:[^@\s]+@[^\s\"'`]+")),
     # Anthropic API keys
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
-    # OpenAI API keys
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{40,}")),
+    # OpenAI project/service-account keys and compatible provider prefixes.
+    # Keep the prefix list explicit to avoid treating ordinary sk-* identifiers as keys.
+    (
+        "openai_key",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])sk-(?:(?:proj|svcacct|or-v1|cp|api)-[A-Za-z0-9_-]{20,}"
+            r"|[0-9a-fA-F]{32}|[A-Za-z0-9]{40,})(?![A-Za-z0-9_-])"
+        ),
+    ),
+    ("supabase_secret", re.compile(r"\bsb_secret_[A-Za-z0-9_-]{20,}")),
+    # FAL key-id:secret pairs and Zhipu id.secret pairs; a UUID/hash alone is not a key.
+    (
+        "fal_key",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+            r":[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    (
+        "zhipu_key",
+        re.compile(r"(?<![A-Za-z0-9_.-])[0-9a-fA-F]{32}\.[A-Za-z0-9]{16}(?![A-Za-z0-9_-])"),
+    ),
     # Google API keys (Gemini, Maps, etc.)
     ("google_api_key", re.compile(r"AIzaSy[A-Za-z0-9_-]{33}")),
     # Groq API keys
@@ -115,6 +150,15 @@ SECRET_PATTERNS = [
     ("slack_token", re.compile(r"xox[bpsa]-[A-Za-z0-9-]{20,}")),
     # Discord webhook URLs (contain a secret token in the path)
     ("discord_webhook", re.compile(r"https?://(?:discord\.com|discordapp\.com)/api/webhooks/\d+/[A-Za-z0-9_-]{20,}")),
+    # Validate the first segment as an encoded numeric account ID in scan_text.
+    (
+        "discord_token",
+        re.compile(
+            r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]{20,32}\.[A-Za-z0-9_-]{6,8}"
+            r"\.[A-Za-z0-9_-]{27,110}(?![A-Za-z0-9_-])"
+        ),
+    ),
+    ("discord_mfa_token", re.compile(r"\bmfa\.[A-Za-z0-9_-]{80,}(?![A-Za-z0-9_-])")),
     # Private keys
     (
         "private_key",
@@ -131,17 +175,18 @@ SECRET_PATTERNS = [
             rf"""
             (?<![A-Za-z0-9])
             {_GENERIC_SECRET_NAME_PATTERN}
+            (?![A-Za-z0-9_-])
             ['"]?
             (?:\s*[=:]\s*|\s+)
-            ['"]?
-            [A-Za-z0-9_/+=.-]{{16,}}
-            ['"]?
+            (?:"(?P<double_quoted>[^"\r\n]{{16,}})"
+              |'(?P<single_quoted>[^'\r\n]{{16,}})'
+              |(?P<unquoted>[{_OPAQUE_SECRET_CHARS}]{{16,}}))
             """,
             re.IGNORECASE | re.VERBOSE,
         ),
     ),
     # Bearer tokens in headers (JWT and non-JWT)
-    ("bearer", re.compile(r"Bearer\s+([A-Za-z0-9_/+=.-]{20,})")),
+    ("bearer", re.compile(rf"(?:Bearer|Bot)\s+([{_OPAQUE_SECRET_CHARS}]{{20,}})", re.IGNORECASE)),
     # IP addresses (public, non-loopback, non-private-by-default)
     (
         "ip_address",
@@ -155,7 +200,10 @@ SECRET_PATTERNS = [
     (
         "password_value",
         re.compile(
-            r"(?:password|passwd|密码)\s*[=:]?\s*\n?\s*([A-Za-z0-9_/+=.-]{8,})\b",
+            rf"(?<![A-Za-z0-9])(?:password|passwd|密码)(?:[_-][A-Za-z0-9]+)*(?![A-Za-z0-9_-])\s*[=:]?\s*\n?\s*"
+            rf'''(?:"(?P<double_quoted>[^"\r\n]{{8,}})"'''
+            rf"|'(?P<single_quoted>[^'\r\n]{{8,}})'"
+            rf"|(?P<unquoted>[{_OPAQUE_SECRET_CHARS}]{{8,}}))",
             re.IGNORECASE,
         ),
     ),
@@ -192,7 +240,6 @@ ALLOWLIST = [
 
 _BASE64_BLOB_RE = re.compile(r"(?:[A-Za-z0-9+/]{4}){1024,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-_BINARY_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0E-\x1F]")
 _WHITESPACE_RE = re.compile(r"\s+")
 _DIGIT_RE = re.compile(r"\d")
 _TELEGRAM_PREFIX_RE = re.compile(r"\b\d{8,10}:")
@@ -204,16 +251,14 @@ def should_skip_large_binary_string(text: str) -> bool:
     if not text or len(text) < 4096:
         return False
 
-    sample = text[:8192]
-    if sample.startswith("data:") and "base64," in sample[:128]:
+    if text.startswith("data:") and "base64," in text[:128]:
         return True
 
     # ANSI color/control sequences are common in long terminal output and should
     # still be treated as text, not binary blobs.
-    sample_without_ansi = sample if "\x1b" not in sample else _ANSI_ESCAPE_RE.sub("", sample)
-    if _BINARY_CONTROL_CHAR_RE.search(sample_without_ansi):
-        return True
-
+    # Examine the whole value: a binary-looking prefix or a single NUL must not
+    # hide plaintext credentials later in a terminal output string.
+    sample_without_ansi = text if "\x1b" not in text else _ANSI_ESCAPE_RE.sub("", text)
     compact = (
         sample_without_ansi
         if _WHITESPACE_RE.search(sample_without_ansi) is None
@@ -339,6 +384,16 @@ def _pattern_may_match(name: str, state: _FastPathState) -> bool:
         return "sk-ant-" in state.case_markers()
     if name == "openai_key":
         return "sk-" in state.case_markers()
+    if name == "supabase_secret":
+        return "sb_secret_" in state.case_markers()
+    if name == "fal_key":
+        return len(text) >= 69 and ":" in text and "-" in text
+    if name == "zhipu_key":
+        return len(text) >= 49 and "." in text
+    if name == "discord_token":
+        return len(text) >= 55 and text.count(".") >= 2
+    if name == "discord_mfa_token":
+        return "mfa." in text
     if name == "google_api_key":
         return "AIzaSy" in state.case_markers()
     if name == "groq_key":
@@ -384,7 +439,7 @@ def _pattern_may_match(name: str, state: _FastPathState) -> bool:
             return False
         return _has_any_marker(state.lower_markers(), _GENERIC_SECRET_MARKERS)
     if name == "bearer":
-        return "Bearer" in state.case_markers() and len(text) >= 27
+        return _has_any_marker(state.lower_markers(), ("bearer", "bot")) and len(text) >= 24
     if name == "ip_address":
         return "." in text and state.has_ipv4_candidate()
     if name == "password_value":
@@ -396,6 +451,36 @@ def _pattern_may_match(name: str, state: _FastPathState) -> bool:
     if name == "high_entropy":
         return ('"' in text or "'" in text) and state.has_digit()
     return True
+
+
+def _is_secret_reference(value: str) -> bool:
+    """Recognize complete placeholder/lookup expressions, never substrings of keys."""
+    if value in {REDACTED, "your_api_key_here", "your_secret_key_here", "your_token_here", "changeme", "replace_me"}:
+        return True
+    if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|<[A-Z_]+>", value):
+        return True
+    name = r"[A-Za-z_][A-Za-z0-9_]*"
+    return bool(
+        re.fullmatch(rf"(?:process\.env|import\.meta\.env)\.{name}", value)
+        or re.fullmatch(rf"(?:os\.environ|process\.env|import\.meta\.env)\[(?:'{name}'|\"{name}\")\]", value)
+        or re.fullmatch(rf"(?:os\.getenv|os\.environ\.get)\((?:'{name}'|\"{name}\")\)", value)
+    )
+
+
+def _allowlisted_match(name: str, value: str) -> bool:
+    # PII exceptions are not credential exceptions. A secret containing a private
+    # IP or an example email must still be removed in its entirety.
+    if name in {"email", "ip_address", "aws_key", "anthropic_key"}:
+        return any(pattern.search(value) for pattern in ALLOWLIST)
+    if name == "db_url":
+        return bool(
+            re.fullmatch(
+                r"postgres(?:ql)?://(?:user:pass|username:password)@"
+                r"(?:localhost|(?:[A-Za-z0-9-]+\.)?example\.com)(?::\d+)?(?:/[^\s?#]*)?",
+                value,
+            )
+        )
+    return False
 
 
 def scan_text(text: str) -> list[dict]:
@@ -410,12 +495,27 @@ def scan_text(text: str) -> list[dict]:
         for match in pattern.finditer(text):
             matched_text = match.group(0)
 
-            if any(allow_pat.search(matched_text) for allow_pat in ALLOWLIST):
+            if _allowlisted_match(name, matched_text):
                 continue
+
+            if name == "discord_token":
+                first = matched_text.split(".", 1)[0]
+                try:
+                    account = base64.b64decode(first + "=" * (-len(first) % 4), altchars=b"-_", validate=True)
+                except (ValueError, binascii.Error):
+                    continue
+                if re.fullmatch(rb"[1-9][0-9]{14,21}", account) is None:
+                    continue
+            if name in {"generic_secret", "password_value"}:
+                secret = next(value for value in match.groupdict().values() if value is not None)
+                if _is_secret_reference(secret):
+                    continue
 
             # For high_entropy, verify string actually looks like a secret
             if name == "high_entropy":
                 inner = matched_text[1:-1]  # strip quotes
+                if _is_secret_reference(inner):
+                    continue
                 if not has_mixed_char_types(inner):
                     continue
                 if shannon_entropy(inner) < 3.5:
@@ -445,21 +545,21 @@ def redact_text(text: str) -> tuple[str, int]:
     if not findings:
         return text, 0
 
-    # Sort by position (descending start) to replace without shifting indices
-    findings.sort(key=lambda f: f["start"], reverse=True)
+    # Redact the UNION of overlaps. Keeping just an inner match can leave the
+    # rest of a credential (for example a JWT signature or FAL suffix) behind.
+    spans: list[tuple[int, int]] = []
+    for finding in sorted(findings, key=lambda item: (item["start"], item["end"])):
+        start, end = finding["start"], finding["end"]
+        if spans and start < spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        else:
+            spans.append((start, end))
 
-    # Deduplicate overlapping findings (keep the later-starting match on overlap)
-    deduped = []
-    for f in findings:
-        if not deduped or f["end"] <= deduped[-1]["start"]:
-            deduped.append(f)
-
-    # Replace from end-to-start (deduped is already in descending start order)
     result = text
-    for f in deduped:
-        result = result[: f["start"]] + REDACTED + result[f["end"] :]
+    for start, end in reversed(spans):
+        result = result[:start] + REDACTED + result[end:]
 
-    return result, len(deduped)
+    return result, len(spans)
 
 
 def redact_custom_strings(text: str, strings: list[str]) -> tuple[str, int]:
@@ -488,13 +588,49 @@ def _transform_value(
     key: str | None = None,
     parent_dict: dict[str, Any] | None = None,
     non_anon_string_keys: frozenset[str] = _NON_ANON_STRING_KEYS,
+    embedded_depth: int = 0,
 ) -> tuple[Any, int, bool]:
     """Recursively anonymize and/or redact a string, list, or dict value."""
     if isinstance(value, str):
         if should_skip_structured_string_transform(key, value, parent_dict):
             return value, 0, False
+        # A structured key supplies the context that scanning its value alone
+        # loses. Never mistake schema IDs or lookup expressions for credentials.
+        if (
+            isinstance(key, str)
+            and _GENERIC_SECRET_NAME_RE.fullmatch(key)
+            and len(value) >= (8 if re.search(r"password|passwd", key, re.IGNORECASE) else 16)
+            and (
+                re.fullmatch(rf"[{_OPAQUE_SECRET_CHARS}]+", value)
+                or (re.search(r"password|passwd", key, re.IGNORECASE) and "\n" not in value and "\r" not in value)
+            )
+            and not _is_secret_reference(value)
+        ):
+            return REDACTED, 1, True
+
         if should_skip_large_binary_string(value):
             return value, 0, False
+
+        # Some providers preserve a whole message/tool result as a JSON string.
+        # Decode only complete JSON containers, so key-based protection also
+        # applies inside these wrappers. Leave unchanged strings byte-for-byte.
+        if embedded_depth < 8 and value.lstrip().startswith(("{", "[")):
+            try:
+                embedded = json.loads(value)
+            except (ValueError, RecursionError):
+                pass
+            else:
+                if isinstance(embedded, (dict, list)):
+                    transformed, n, changed = _transform_value(
+                        embedded,
+                        anonymizer,
+                        custom_strings,
+                        non_anon_string_keys=non_anon_string_keys,
+                        embedded_depth=embedded_depth + 1,
+                    )
+                    if changed:
+                        return json.dumps(transformed, ensure_ascii=False), n, True
+                    return value, 0, False
 
         result = value
         count = 0
@@ -520,13 +656,32 @@ def _transform_value(
         total = 0
         out: dict[Any, Any] | None = None
         for k, v in value.items():
-            transformed, n, changed = _transform_value(v, anonymizer, custom_strings, k, value, non_anon_string_keys)
+            transformed, n, changed = _transform_value(
+                v, anonymizer, custom_strings, k, value, non_anon_string_keys, embedded_depth
+            )
             total += n
+            transformed_key = k
+            if isinstance(k, str):
+                transformed_key, n = redact_text(k)
+                total += n
+                if custom_strings:
+                    transformed_key, n = redact_custom_strings(transformed_key, custom_strings)
+                    total += n
+            key_changed = transformed_key != k
             if out is None:
-                if not changed:
+                if not changed and not key_changed:
                     continue
                 out = dict(value)
-            out[k] = transformed
+            if key_changed:
+                del out[k]
+                # Two secret-bearing keys must not overwrite one another, or a
+                # pre-existing literal [REDACTED] field, after sanitization.
+                base_key = transformed_key
+                suffix = 2
+                while transformed_key in out:
+                    transformed_key = f"{base_key}#{suffix}"
+                    suffix += 1
+            out[transformed_key] = transformed
         if out is None:
             return value, 0, False
         return out, total, True
@@ -542,6 +697,7 @@ def _transform_value(
                 key,
                 parent_dict,
                 non_anon_string_keys,
+                embedded_depth,
             )
             total += n
             if out_list is None:
@@ -562,7 +718,6 @@ def transform_session(
     non_anon_string_keys: frozenset[str] | set[str] | None = None,
 ) -> tuple[dict, int]:
     """Anonymize and redact all exported session content in one pass."""
-    total = 0
     effective_non_anon_string_keys = _NON_ANON_STRING_KEYS | frozenset(non_anon_string_keys or ())
 
     # Project labels are intentionally kept in non_anon_string_keys so they're stable identifiers,
@@ -575,72 +730,19 @@ def transform_session(
         if anonymized_label != project_label:
             session["project"] = anonymized_label
 
-    for msg in session.get("messages", []):
-        for field in ("content", "thinking"):
-            if msg.get(field):
-                msg[field], count, _changed = _transform_value(
-                    msg[field],
-                    anonymizer,
-                    custom_strings,
-                    field,
-                    msg,
-                    effective_non_anon_string_keys,
-                )
-                total += count
-        if msg.get("content_parts"):
-            msg["content_parts"], count, _changed = _transform_value(
-                msg["content_parts"],
-                anonymizer,
-                custom_strings,
-                "content_parts",
-                msg,
-                effective_non_anon_string_keys,
-            )
-            total += count
-        for tool_use in msg.get("tool_uses", []):
-            for field in ("input", "output"):
-                if tool_use.get(field):
-                    tool_use[field], count, _changed = _transform_value(
-                        tool_use[field],
-                        anonymizer,
-                        custom_strings,
-                        field,
-                        tool_use,
-                        effective_non_anon_string_keys,
-                    )
-                    total += count
-
+    transformed, total, changed = _transform_value(
+        session, anonymizer, custom_strings, non_anon_string_keys=effective_non_anon_string_keys
+    )
+    if changed:
+        session.clear()
+        session.update(transformed)
     return session, total
 
 
 def redact_session(session: dict, custom_strings: list[str] | None = None) -> tuple[dict, int]:
     """Redact all secrets in a session dict. Returns (redacted_session, total_redactions)."""
-    total = 0
-
-    for msg in session.get("messages", []):
-        for field in ("content", "thinking"):
-            if msg.get(field):
-                msg[field], count, _changed = _transform_value(
-                    msg[field], custom_strings=custom_strings, key=field, parent_dict=msg
-                )
-                total += count
-        if msg.get("content_parts"):
-            msg["content_parts"], count, _changed = _transform_value(
-                msg["content_parts"],
-                custom_strings=custom_strings,
-                key="content_parts",
-                parent_dict=msg,
-            )
-            total += count
-        for tool_use in msg.get("tool_uses", []):
-            for field in ("input", "output"):
-                if tool_use.get(field):
-                    tool_use[field], count, _changed = _transform_value(
-                        tool_use[field],
-                        custom_strings=custom_strings,
-                        key=field,
-                        parent_dict=tool_use,
-                    )
-                    total += count
-
+    transformed, total, changed = _transform_value(session, custom_strings=custom_strings)
+    if changed:
+        session.clear()
+        session.update(transformed)
     return session, total
